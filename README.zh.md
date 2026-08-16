@@ -62,4 +62,4 @@ npm run build:lib:client
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 Li TangKe
+[MIT](LICENSE) © 2026 lgYanami

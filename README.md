@@ -62,4 +62,4 @@ None: this package renders durable session facts for humans and adds no prompt, 
 
 ## License
 
-[MIT](LICENSE) © 2026 Li TangKe
+[MIT](LICENSE) © 2026 lgYanami
