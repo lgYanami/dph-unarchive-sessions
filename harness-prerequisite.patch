@@ -1,0 +1,804 @@
+diff --git a/packages/bundle/web-app/cordis.patch.yml b/packages/bundle/web-app/cordis.patch.yml
+index b06e63b54f..bcf0488f51 100644
+--- a/packages/bundle/web-app/cordis.patch.yml
++++ b/packages/bundle/web-app/cordis.patch.yml
+@@ -219,6 +219,12 @@
+     - id: ui-workspace
+       name: '@deepseek-ai/dsh-client-ui-workspace'
+ 
++    # Archived-session restore: the panel filling the workspace browser's
++    # archived-panel hole, which also gates the row menu's "查看归档会话"
++    # entry. Remove this row to take the entry and panel away together.
++    - id: ui-unarchive
++      name: '@deepseek-ai/dsh-client-ui-unarchive'
++
+     # Input triggers: the '/' | '@' pipeline (ui-input-trigger), the command surface over
+     # it (ui-commands), and the two reference sources (ui-skill / ui-subagent).
+     - id: ui-input-trigger
+diff --git a/packages/bundle/web-app/package.json b/packages/bundle/web-app/package.json
+index ca4709a2a9..5107fe653e 100644
+--- a/packages/bundle/web-app/package.json
++++ b/packages/bundle/web-app/package.json
+@@ -78,6 +78,7 @@
+     "@deepseek-ai/dsh-client-ui-jobs": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-theme": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-tool": "workspace:^",
++    "@deepseek-ai/dsh-client-ui-unarchive": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-workflow-run": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-trajectory": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-workspace": "workspace:^",
+diff --git a/packages/client/connection/src/client/fixture.ts b/packages/client/connection/src/client/fixture.ts
+index dd0566486e..9bf1f43f5a 100644
+--- a/packages/client/connection/src/client/fixture.ts
++++ b/packages/client/connection/src/client/fixture.ts
+@@ -2694,6 +2694,15 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
+         }
+         return ok(request, { archivedSessionIds: [...archivedSessionIds] })
+       },
++      unarchiveSession: (request) => {
++        const { sessionId } = request.payload
++        const index = archivedSessionIds.indexOf(sessionId)
++        if (index !== -1) {
++          archivedSessionIds.splice(index, 1)
++          emitHost({ type: 'host/archived-sessions-changed', archivedSessionIds: [...archivedSessionIds] })
++        }
++        return ok(request, { archivedSessionIds: [...archivedSessionIds] })
++      },
+     },
+     agentPresets: {
+       // Both trusts appear, because a surface must present a locally authored
+@@ -3105,6 +3114,7 @@ export class FixtureApiClient extends AbstractApiClient {
+       case 'workspace.insertBefore': return this.api.workspace.insertBefore(request)
+       case 'workspace.insertSessionBefore': return this.api.workspace.insertSessionBefore(request)
+       case 'workspace.archiveSession': return this.api.workspace.archiveSession(request)
++      case 'workspace.unarchiveSession': return this.api.workspace.unarchiveSession(request)
+       case 'skill.list': return this.api.skills.list(request)
+       case 'agentPreset.list': return this.api.agentPresets.list(request)
+       case 'agentPreset.select': return this.api.agentPresets.select(request)
+diff --git a/packages/client/connection/tests/fake-api.client.ts b/packages/client/connection/tests/fake-api.client.ts
+index bee4fc0ce0..02850429a5 100644
+--- a/packages/client/connection/tests/fake-api.client.ts
++++ b/packages/client/connection/tests/fake-api.client.ts
+@@ -167,6 +167,9 @@ export class FakeApiClient implements IApiClient {
+     archiveSession: (payload: unknown) => this.record('workspace.archiveSession', payload, Promise.resolve(ok({
+       archivedSessionIds: [(payload as { sessionId: SessionId }).sessionId],
+     }))),
++    unarchiveSession: (payload: unknown) => this.record('workspace.unarchiveSession', payload, Promise.resolve(ok({
++      archivedSessionIds: [],
++    }))),
+   }
+ 
+   // Payloads stay `unknown` (lint-lane note above); response rows are the real
+diff --git a/packages/client/runtime/src/client/contract/workspaces.ts b/packages/client/runtime/src/client/contract/workspaces.ts
+index 4012086c3d..4eaee2ac4c 100644
+--- a/packages/client/runtime/src/client/contract/workspaces.ts
++++ b/packages/client/runtime/src/client/contract/workspaces.ts
+@@ -91,4 +91,10 @@ export interface IWorkspaces {
+    * @param sessionId - session to archive.
+    */
+   archiveSession(sessionId: SessionId): Promise<void>
++  /**
++   * Restore an archived session into the grouping surfaces it was hidden
++   * from; it reappears in its existing workspace account position.
++   * @param sessionId - archived session to restore.
++   */
++  unarchiveSession(sessionId: SessionId): Promise<void>
+ }
+diff --git a/packages/client/runtime/src/client/workspaces/manager.ts b/packages/client/runtime/src/client/workspaces/manager.ts
+index 9b54dbb429..252bc86324 100644
+--- a/packages/client/runtime/src/client/workspaces/manager.ts
++++ b/packages/client/runtime/src/client/workspaces/manager.ts
+@@ -231,6 +231,18 @@ export class WorkspaceManager {
+     return result
+   }
+ 
++  /**
++   * Restore one archived session, then install the returned full set
++   * without waiting for the changed frame.
++   * @param sessionId - archived session to restore.
++   * @returns the wire result.
++   */
++  async unarchiveSession(sessionId: SessionId): Promise<RpcResult<{ archivedSessionIds: SessionId[] }>> {
++    const { result } = await this.api.workspace.unarchiveSession({ sessionId })
++    if (result.ok) this.installArchived(result.value.archivedSessionIds)
++    return result
++  }
++
+   /**
+    * Host-frame entry. Non-workspace frames are ignored so the runtime can
+    * fan one host stream out to both object managers.
+diff --git a/packages/client/runtime/src/client/workspaces/service.ts b/packages/client/runtime/src/client/workspaces/service.ts
+index c23e3b3a6c..5afd36ff49 100644
+--- a/packages/client/runtime/src/client/workspaces/service.ts
++++ b/packages/client/runtime/src/client/workspaces/service.ts
+@@ -292,6 +292,16 @@ export class WorkspaceRuntime implements IWorkspaces {
+     if (!result.ok) throw new Error(`session archive failed: ${result.error.code}: ${result.error.message}`)
+   }
+ 
++  /**
++   * Restore an archived session into the registry-global set's complement:
++   * the session reappears in its existing workspace account position.
++   * @param sessionId - archived session to restore.
++   */
++  async unarchiveSession(sessionId: SessionId): Promise<void> {
++    const result = await this.manager.unarchiveSession(sessionId)
++    if (!result.ok) throw new Error(`session unarchive failed: ${result.error.code}: ${result.error.message}`)
++  }
++
+   /**
+    * Move a session within its Workspace's manual order (DOM-insertBefore-like).
+    * @param workspaceId - owning workspace.
+diff --git a/packages/client/runtime/tests/fake-api.client.ts b/packages/client/runtime/tests/fake-api.client.ts
+index 33a0efbbfd..1a593f8f02 100644
+--- a/packages/client/runtime/tests/fake-api.client.ts
++++ b/packages/client/runtime/tests/fake-api.client.ts
+@@ -219,6 +219,8 @@ export class FakeApiClient implements IApiClient {
+       this.record('workspace.insertSessionBefore', payload, this.onWorkspaceInsertSessionBefore(payload)),
+     archiveSession: (payload: unknown) =>
+       this.record('workspace.archiveSession', payload, this.onWorkspaceArchiveSession(payload)),
++    unarchiveSession: (payload: unknown) =>
++      this.record('workspace.unarchiveSession', payload, Promise.resolve(ok({ archivedSessionIds: [] }))),
+   }
+ 
+   // Payloads stay `unknown` (lint-lane note above); response rows are the real
+diff --git a/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx b/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
+index d0f6835472..ee212d23bb 100644
+--- a/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
++++ b/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
+@@ -241,6 +241,10 @@ type SessionTreeProps = Pick<
+   onSessionRename: (sessionId: SessionNode['id'], currentTitle: string) => void
+   /** Archive a session (row menu action; the row disappears on the state echo). */
+   onSessionArchive: (sessionId: SessionNode['id']) => void
++  /** True while the archived-panel hole is occupied (gates the row menu entry). */
++  archivedPanelAvailable: boolean
++  /** Open the browser-owned archived panel scoped to one Workspace. */
++  onShowArchived: (workspaceId: WorkspaceId) => void
+   /** Session order behavior: fixed after edits, or additionally promoted by user activity. */
+   orderBy: SessionOrderBy
+ }
+@@ -249,6 +253,7 @@ type SessionTreeProps = Pick<
+ function SessionTree({
+   useSessions, startSession, open, forkSession, workspaces, archivedSessionIds,
+   onRenameRequest, onDeleteRequest, onSessionRename, onSessionArchive,
++  archivedPanelAvailable, onShowArchived,
+   insertWorkspaceBefore, insertSessionBefore, orderBy,
+   groupExpansion, setGroupExpanded,
+   sessionOrderByAccount, sessionUpdatedAtByAccount, syncSessionOrderAccount, setSessionOrder, t,
+@@ -475,6 +480,9 @@ function SessionTree({
+                     /* v8 ignore next -- narrowing guard: the actions object exists only for real-workspace groups. */
+                       if (group.workspaceId !== undefined) onDeleteRequest(group.workspaceId, group.label)
+                     },
++                    showArchived: archivedPanelAvailable && group.workspaceId !== undefined
++                      ? () => onShowArchived(group.workspaceId as WorkspaceId)
++                      : undefined,
+                   }}
+               />
+               {(expandedSessionGroups.includes(group.key)
+@@ -758,6 +766,7 @@ export function WorkspaceBrowser({
+   searchSessions,
+   searchResultLimit,
+   useDirectoryFlow,
++  useArchivedPanel,
+   renderSlot,
+   t,
+ }: WorkspaceBrowserProps) {
+@@ -767,6 +776,12 @@ export function WorkspaceBrowser({
+   // Live occupancy of this surface's directory-flow hole (the same source the
+   // flow reads): a composition without a picking affordance can add nothing.
+   const directoryFlowAvailable = useDirectoryFlow(occupied => occupied)
++  // Same gate for the workspace row menu's archived-session entry.
++  const archivedPanelAvailable = useArchivedPanel(occupied => occupied)
++  const [archivedPanel, setArchivedPanel] = useState<{ open: boolean; scope: WorkspaceId | null }>({
++    open: false,
++    scope: null,
++  })
+   const groupBy = useStore(s => s.groupBy)
+   const orderBy = useStore(s => s.orderBy)
+   const groupExpansion = useStore(s => s.groupExpansion)
+@@ -1147,6 +1162,8 @@ export function WorkspaceBrowser({
+                 syncSessionOrderAccount={actions.syncSessionOrderAccount}
+                 setSessionOrder={actions.setSessionOrder}
+                 archivedSessionIds={archivedSessionIds}
++                archivedPanelAvailable={archivedPanelAvailable}
++                onShowArchived={(workspaceId) => setArchivedPanel({ open: true, scope: workspaceId })}
+                 startSession={startSession}
+                 open={open}
+                 insertWorkspaceBefore={insertWorkspaceBefore}
+@@ -1257,6 +1274,14 @@ export function WorkspaceBrowser({
+         {deleting && <div className={css.deleteStatus} role="status">{t('delete.pending')}</div>}
+         {deleteError !== null && <div className={css.renameError} role="alert">{deleteError}</div>}
+       </Modal>
++
++      {/* The archived-session panel hole: the occupant owns the overlay; this
++          browser owns open state and scope (the row menu re-scopes on open). */}
++      {archivedPanelAvailable && renderSlot('sidebar.workspaces.archivedPanel', {
++        open: archivedPanel.open,
++        scope: archivedPanel.scope,
++        onClose: () => setArchivedPanel(panel => ({ ...panel, open: false })),
++      })}
+     </div>
+   )
+ }
+diff --git a/packages/client/ui-workspace/src/client/contract/slots.ts b/packages/client/ui-workspace/src/client/contract/slots.ts
+index 8027a3623a..43eb8dd176 100644
+--- a/packages/client/ui-workspace/src/client/contract/slots.ts
++++ b/packages/client/ui-workspace/src/client/contract/slots.ts
+@@ -56,6 +56,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
+     'conversation.hero.workspace.directoryFlow': { kind: 'single'; scope: 'root'; owner: DirectoryFlowOwnerProps }
+     /** Directory-flow hole under the sidebar browsing region (declared by the WorkspaceBrowser entry). */
+     'sidebar.workspaces.directoryFlow': { kind: 'single'; scope: 'root'; owner: DirectoryFlowOwnerProps }
++    /** Archived-session panel hole under the sidebar browsing region (declared by the WorkspaceBrowser entry). */
++    'sidebar.workspaces.archivedPanel': { kind: 'single'; scope: 'root'; owner: ArchivedPanelOwnerProps }
+   }
+ }
+ 
+@@ -84,12 +86,45 @@ export type DirectoryPickingHooks = {
+   useDirectoryFlow: SnapshotSelectorHook<boolean>
+ }
+ 
++/**
++ * Owner share of the archived-session panel hole: the browser owns the open
++ * state (the workspace row menu entry opens it) and hands the occupant a
++ * workspace scope — `null` shows every archived session, a workspace id
++ * filters to that workspace's account.
++ */
++export interface ArchivedPanelOwnerProps {
++  /** True while the panel should be open. */
++  open: boolean
++  /** Workspace the panel is scoped to; null lists every archived session. */
++  scope: WorkspaceId | null
++  /** The occupant asks the owner to close the panel (menu reopen re-scopes). */
++  onClose: () => void
++}
++
++/**
++ * Archived-panel occupancy share, same mechanism as the directory-flow
++ * hooks: the workspace row menu gains its entry only while the hole is
++ * filled, so a composition without the panel package adds nothing.
++ */
++export type ArchivedPanelInjected = {
++  hooks: {
++    /** True while this surface's archived-panel hole is occupied. */
++    archivedPanel: HostObservable<boolean>
++  }
++}
++
++/** Component-side view of the panel share: the bound occupancy selector hook. */
++export type ArchivedPanelHooks = {
++  /** Selector hook over this surface's archived-panel occupancy. */
++  useArchivedPanel: SnapshotSelectorHook<boolean>
++}
++
+ /**
+  * Browser-private injected share (arrives via the register inject factory).
+  * Data reads use the global framework hooks; these are the Host actions the
+  * browsing region drives.
+  */
+-export type WorkspaceBrowserInjected = DirectoryPickingInjected & {
++export type WorkspaceBrowserInjected = DirectoryPickingInjected & ArchivedPanelInjected & {
+   /**
+    * Start a New Session in a Workspace: reuse-or-create its blank session and
+    * open it; without an explicit workspace, inherit the current Session
+@@ -140,10 +175,11 @@ export type WorkspaceBrowserInjected = DirectoryPickingInjected & {
+ /** Full browser props: shell owner share + viewing store + injected actions + the locale seat. */
+ export type WorkspaceBrowserProps =
+   PropsRuntime<'sidebar.workspaces'>
+-  & PropsRenderSlots<'sidebar.workspaces.directoryFlow'>
++  & PropsRenderSlots<'sidebar.workspaces.directoryFlow' | 'sidebar.workspaces.archivedPanel'>
+   & PropsStore<ReturnType<typeof createWorkspaceViewStore>>
+   & Omit<WorkspaceBrowserInjected, 'hooks'>
+   & DirectoryPickingHooks
++  & ArchivedPanelHooks
+   & PropsLocale<'workspace'>
+ 
+ /**
+diff --git a/packages/client/ui-workspace/src/client/index.ts b/packages/client/ui-workspace/src/client/index.ts
+index 6b14243ecf..e63bd81c1b 100644
+--- a/packages/client/ui-workspace/src/client/index.ts
++++ b/packages/client/ui-workspace/src/client/index.ts
+@@ -19,6 +19,7 @@ import { WorkspacePicker } from './WorkspacePicker.tsx'
+ import { en, zh, type WorkspaceKey } from './locales.ts'
+ 
+ export type {
++  ArchivedPanelHooks, ArchivedPanelInjected, ArchivedPanelOwnerProps,
+   DirectoryFlowOwnerProps, DirectoryFlowSlotName, DirectoryPickingHooks, DirectoryPickingInjected,
+   WorkspaceBrowserInjected, WorkspaceBrowserProps, WorkspacePickerInjected, WorkspacePickerProps,
+ } from './contract/slots.ts'
+@@ -60,13 +61,16 @@ export function apply(ctx: ClientContext): void {
+   }
+ 
+   // Stable per-surface occupancy sources (the renderer's hook cache keys by
+-  // source identity): true while the surface's directory-flow hole is filled.
+-  const flowSource = (hole: 'sidebar.workspaces.directoryFlow' | 'conversation.hero.workspace.directoryFlow'): HostObservable<boolean> => ({
++  // source identity): true while the surface's hole is filled.
++  const flowSource = (hole: 'sidebar.workspaces.directoryFlow' | 'conversation.hero.workspace.directoryFlow' | 'sidebar.workspaces.archivedPanel'): HostObservable<boolean> => ({
+     getSnapshot: () => ctx.slots.entries(hole).length > 0,
+     subscribe: listener => ctx.slots.subscribe(hole, listener),
+   })
+   const browserFlowSource = flowSource('sidebar.workspaces.directoryFlow')
+   const pickerFlowSource = flowSource('conversation.hero.workspace.directoryFlow')
++  // Gates the workspace row menu's archived-session entry on the panel
++  // package: a composition without it adds nothing to the menu.
++  const archivedPanelSource = flowSource('sidebar.workspaces.archivedPanel')
+   const browserInjected = (): WorkspaceBrowserInjected => ({
+     // Explicit group actions keep their target; unscoped New Session inherits
+     // the current Session Workspace before the recent-Workspace fallback.
+@@ -99,18 +103,21 @@ export function apply(ctx: ClientContext): void {
+       await ctx.workspaces.insertSessionBefore(workspaceId, sessionId, beforeSessionId)
+     },
+     createWorkspace: input => ctx.workspaces.create(input),
+-    hooks: { directoryFlow: browserFlowSource },
++    hooks: { directoryFlow: browserFlowSource, archivedPanel: archivedPanelSource },
+   })
+   const pickerInjected = (): WorkspacePickerInjected => ({
+     createWorkspace: input => ctx.workspaces.create(input),
+     hooks: { directoryFlow: pickerFlowSource },
+   })
+-  // Each registration declares its directory-flow child in the same call;
+-  // slot injection follows both the owner and declaration HMR lifetimes.
++  // Each registration declares its child holes in the same call; slot
++  // injection follows both the owner and declaration HMR lifetimes.
+   ctx.slots.inject('sidebar.workspaces', () => ctx.slots.register(
+     {
+       name: 'sidebar.workspaces',
+-      children: { 'sidebar.workspaces.directoryFlow': { kind: 'single', scope: 'root' } },
++      children: {
++        'sidebar.workspaces.directoryFlow': { kind: 'single', scope: 'root' },
++        'sidebar.workspaces.archivedPanel': { kind: 'single', scope: 'root' },
++      },
+       store: createWorkspaceViewStore(),
+       inject: browserInjected,
+       locale: NS,
+diff --git a/packages/client/ui-workspace/src/client/locales.ts b/packages/client/ui-workspace/src/client/locales.ts
+index c08fd931de..4a823db332 100644
+--- a/packages/client/ui-workspace/src/client/locales.ts
++++ b/packages/client/ui-workspace/src/client/locales.ts
+@@ -45,6 +45,7 @@ export const zh = {
+   'delete.pending': '正在删除工作区…',
+   'menu.fork': '分叉会话',
+   'menu.archiveSession': '归档会话',
++  'menu.archivedSessions': '查看归档会话',
+   'sessions.count.one': '{n} 个会话',
+   'sessions.count.other': '{n} 个会话',
+   'actions.workspace.aria': '工作区“{name}”的操作',
+@@ -114,6 +115,7 @@ export const en = {
+   'delete.pending': 'Deleting workspace…',
+   'menu.fork': 'Fork session',
+   'menu.archiveSession': 'Archive session',
++  'menu.archivedSessions': 'View archived sessions',
+   'sessions.count.one': '{n} session',
+   'sessions.count.other': '{n} sessions',
+   'actions.workspace.aria': 'Workspace actions for {name}',
+diff --git a/packages/client/ui-workspace/src/client/rows/Rows.tsx b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+index 481e0f0e47..306ae427a7 100644
+--- a/packages/client/ui-workspace/src/client/rows/Rows.tsx
++++ b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+@@ -112,7 +112,7 @@ export function ProjectRowItem({ group, onToggle, onCreate, actions, drag, t }:
+   onToggle: () => void
+   onCreate: () => void
+   /** Real-Workspace actions; absent for the ungrouped bucket (no menu shown). */
+-  actions?: { rename: () => void; delete: () => void } | undefined
++  actions?: { rename: () => void; delete: () => void; showArchived?: (() => void) | undefined } | undefined
+   /** Present only for real Workspace rows in the grouped view. */
+   drag?: WorkspaceRowDragProps | undefined
+   t: RowTranslate
+@@ -125,6 +125,12 @@ export function ProjectRowItem({ group, onToggle, onCreate, actions, drag, t }:
+   const workspaceMenuItems = [
+     { id: 'rename', label: t('rename'), icon: <IconEditOutline16 /> },
+     { id: 'delete', label: t('delete.workspace'), icon: <IconTrashOutline16 />, danger: true },
++    // The archived-session entry appears only while the panel hole is
++    // occupied (the browser's occupancy gate), so the menu never offers an
++    // action with no panel behind it.
++    ...actions?.showArchived === undefined
++      ? []
++      : [{ id: 'archived', label: t('menu.archivedSessions'), icon: <IconArchiveOutline20 /> }],
+   ]
+   const ownRow = (
+     <div
+@@ -161,10 +167,14 @@ export function ProjectRowItem({ group, onToggle, onCreate, actions, drag, t }:
+               setMenuOpen(false)
+               // Unknown ids leave before the dispatch: a future menu row must
+               // not inherit the destructive branch as an else fallback.
+-              /* v8 ignore next -- workspaceMenuItems carries exactly these two rows today. */
+-              if (id !== 'rename' && id !== 'delete') return
++              /* v8 ignore next -- workspaceMenuItems carries exactly these rows today. */
++              if (id !== 'rename' && id !== 'delete' && id !== 'archived') return
++              if (id === 'archived' && actions.showArchived !== undefined) {
++                actions.showArchived()
++                return
++              }
+               if (id === 'rename') actions.rename()
+-              else actions.delete()
++              else if (id === 'delete') actions.delete()
+             }}
+             portal
+             closeOnPointerLeave
+diff --git a/packages/client/ui-workspace/tests/apply.client.spec.ts b/packages/client/ui-workspace/tests/apply.client.spec.ts
+index 016af313f8..924f3bf1a0 100644
+--- a/packages/client/ui-workspace/tests/apply.client.spec.ts
++++ b/packages/client/ui-workspace/tests/apply.client.spec.ts
+@@ -140,6 +140,25 @@ describe('ui-workspace apply', () => {
+     unsubscribe()
+   })
+ 
++  it('declares the archived-panel hole and reports its occupancy', async () => {
++    const b = await bench()
++    declare(b.slots, 'sidebar.workspaces')
++    await b.ctx.plugin({ inject: [...inject], apply }).await()
++    expect(b.slots.spec('sidebar.workspaces.archivedPanel')).toMatchObject({ kind: 'single' })
++
++    const browser = (b.slots.entries('sidebar.workspaces')[0]!.inject as () => WorkspaceBrowserInjected)()
++    expect(browser.hooks.archivedPanel.getSnapshot()).toBe(false)
++    const notified = vi.fn()
++    const unsubscribe = browser.hooks.archivedPanel.subscribe(notified)
++    const dispose = b.slots.register({ name: 'sidebar.workspaces.archivedPanel' } as never, () => null)
++    expect(browser.hooks.archivedPanel.getSnapshot()).toBe(true)
++    await Promise.resolve()
++    expect(notified).toHaveBeenCalled()
++    dispose()
++    expect(browser.hooks.archivedPanel.getSnapshot()).toBe(false)
++    unsubscribe()
++  })
++
+   it('rejects the browser search callback on a runtime business error', async () => {
+     const b = await bench()
+     b.search.mockImplementationOnce(async () => ({
+diff --git a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+index fbe42fc279..04cd27340a 100644
+--- a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
++++ b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+@@ -80,6 +80,7 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
+     insertSessionBefore: vi.fn(async () => {}),
+     createWorkspace: vi.fn(async () => workspace('created', [])),
+     useDirectoryFlow: bindSnapshotSelector({ getSnapshot: () => true, subscribe: () => () => {} }),
++    useArchivedPanel: bindSnapshotSelector({ getSnapshot: () => false, subscribe: () => () => {} }),
+     renderSlot: ((_name: string, owner: { open: boolean }) => (owner.open ? <div data-testid="directory-flow" /> : null)) as never,
+     t,
+     ...overrides,
+@@ -1011,6 +1012,29 @@ describe('WorkspaceBrowser', () => {
+     expect(screen.queryByRole('dialog')).toBeNull()
+   })
+ 
++  it('opens the archived-session panel from the workspace row menu when the hole is occupied', () => {
++    let lastOwner: { open: boolean; scope: WorkspaceId | null } | null = null
++    const renderSlot = ((name: string, owner: { open: boolean; scope: WorkspaceId | null }) => {
++      if (name === 'sidebar.workspaces.archivedPanel') lastOwner = owner
++      return null
++    }) as never
++    mount({
++      useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha')])),
++      useArchivedPanel: bindSnapshotSelector({ getSnapshot: () => true, subscribe: () => () => {} }),
++      renderSlot,
++    })
++    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
++    fireEvent.click(screen.getByRole('menuitem', { name: '查看归档会话' }))
++    expect(lastOwner).toMatchObject({ open: true, scope: wid('alpha') })
++  })
++
++  it('hides the archived-session menu entry while the panel hole is unoccupied', () => {
++    mount({ useWorkspaces: hook(workspaceState([workspace('alpha', [], 'Alpha')])) })
++    fireEvent.click(screen.getByRole('button', { name: '工作区“Alpha”的操作' }))
++    expect(screen.getByRole('menuitem', { name: '重命名' })).toBeTruthy()
++    expect(screen.queryByRole('menuitem', { name: '查看归档会话' })).toBeNull()
++  })
++
+   it('rename via Enter, failure surfaces the error, Cancel closes', async () => {
+     const renameWorkspace = vi.fn(async () => { throw new Error('rename conflict') })
+     mount({
+diff --git a/packages/host/apiproxy/src/api-proxy.ts b/packages/host/apiproxy/src/api-proxy.ts
+index bda99362b6..869a74b50b 100644
+--- a/packages/host/apiproxy/src/api-proxy.ts
++++ b/packages/host/apiproxy/src/api-proxy.ts
+@@ -2918,6 +2918,15 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
+         }
+         return ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] })
+       },
++
++      async unarchiveSession(request) {
++        const { sessionId } = request.payload
++        // Unarchiving an id that is not archived is an idempotent no-op, so
++        // the gateway has no business-error branch; durability failures
++        // propagate as internal errors like every other write.
++        await ctx.workspaceRegistry.unarchiveSession(sessionId)
++        return ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] })
++      },
+     },
+ 
+     host: {
+diff --git a/packages/host/apiproxy/src/api/rpc-map.ts b/packages/host/apiproxy/src/api/rpc-map.ts
+index 80dede1799..06a3cd543d 100644
+--- a/packages/host/apiproxy/src/api/rpc-map.ts
++++ b/packages/host/apiproxy/src/api/rpc-map.ts
+@@ -50,6 +50,7 @@ export interface RpcMethodMap {
+   'workspace.insertBefore': WorkspaceApi['insertBefore']
+   'workspace.insertSessionBefore': WorkspaceApi['insertSessionBefore']
+   'workspace.archiveSession': WorkspaceApi['archiveSession']
++  'workspace.unarchiveSession': WorkspaceApi['unarchiveSession']
+   'skill.list': SkillsApi['list']
+   'agentPreset.list': AgentPresetsApi['list']
+   'agentPreset.select': AgentPresetsApi['select']
+diff --git a/packages/host/apiproxy/src/api/workspace.schema.ts b/packages/host/apiproxy/src/api/workspace.schema.ts
+index b57305141c..0f139687db 100644
+--- a/packages/host/apiproxy/src/api/workspace.schema.ts
++++ b/packages/host/apiproxy/src/api/workspace.schema.ts
+@@ -98,3 +98,13 @@ export const workspaceArchiveSessionRequestSchema = z.object({
+ export const workspaceArchiveSessionValueSchema = z.object({
+   archivedSessionIds: z.array(sessionIdSchema),
+ }) satisfies z.ZodType<Wire<ResponseValue<'workspace.archiveSession'>>>
++
++/** workspace.unarchiveSession request payload. */
++export const workspaceUnarchiveSessionRequestSchema = z.object({
++  sessionId: sessionIdSchema,
++}) satisfies z.ZodType<Wire<RequestPayload<'workspace.unarchiveSession'>>>
++
++/** workspace.unarchiveSession response value: the full updated archive set. */
++export const workspaceUnarchiveSessionValueSchema = z.object({
++  archivedSessionIds: z.array(sessionIdSchema),
++}) satisfies z.ZodType<Wire<ResponseValue<'workspace.unarchiveSession'>>>
+diff --git a/packages/host/apiproxy/src/api/workspace.ts b/packages/host/apiproxy/src/api/workspace.ts
+index d36d0c406e..a3b2c24ede 100644
+--- a/packages/host/apiproxy/src/api/workspace.ts
++++ b/packages/host/apiproxy/src/api/workspace.ts
+@@ -106,4 +106,14 @@ export interface WorkspaceApi {
+    */
+   archiveSession(request: RpcRequest<{ sessionId: SessionId }>):
+   Promise<RpcResponse<{ archivedSessionIds: SessionId[] }>>
++
++  /**
++   * Removes one session from the registry-global archive set: the session
++   * reappears in its existing workspace account (or ungrouped) position,
++   * which archiving never removed. Idempotent for an id that is not
++   * archived. Returns the full updated set (same snapshot the changed frame
++   * carries).
++   */
++  unarchiveSession(request: RpcRequest<{ sessionId: SessionId }>):
++  Promise<RpcResponse<{ archivedSessionIds: SessionId[] }>>
+ }
+diff --git a/packages/host/apiproxy/src/fetch/client.ts b/packages/host/apiproxy/src/fetch/client.ts
+index 70e3ece58f..3818969818 100644
+--- a/packages/host/apiproxy/src/fetch/client.ts
++++ b/packages/host/apiproxy/src/fetch/client.ts
+@@ -39,6 +39,7 @@ import {
+   workspaceInsertSessionBeforeValueSchema,
+   workspaceListValueSchema,
+   workspaceRenameValueSchema,
++  workspaceUnarchiveSessionValueSchema,
+ } from '../api/workspace.schema.ts'
+ import { skillListValueSchema } from '../api/skills.schema.ts'
+ import {
+@@ -120,6 +121,7 @@ export interface IApiClient {
+     insertBefore(payload: RequestPayload<'workspace.insertBefore'>, signal?: AbortSignal): Promise<RpcResponse<ResponseValue<'workspace.insertBefore'>>>
+     insertSessionBefore(payload: RequestPayload<'workspace.insertSessionBefore'>, signal?: AbortSignal): Promise<RpcResponse<ResponseValue<'workspace.insertSessionBefore'>>>
+     archiveSession(payload: RequestPayload<'workspace.archiveSession'>, signal?: AbortSignal): Promise<RpcResponse<ResponseValue<'workspace.archiveSession'>>>
++    unarchiveSession(payload: RequestPayload<'workspace.unarchiveSession'>, signal?: AbortSignal): Promise<RpcResponse<ResponseValue<'workspace.unarchiveSession'>>>
+   }
+   skills: {
+     list(payload: RequestPayload<'skill.list'>, signal?: AbortSignal): Promise<RpcResponse<ResponseValue<'skill.list'>>>
+@@ -198,6 +200,7 @@ const UNARY_VALUE_SCHEMAS: { [K in keyof RpcMethodMap]: z.ZodType<Wire<ResponseV
+   'workspace.insertBefore': workspaceInsertBeforeValueSchema,
+   'workspace.insertSessionBefore': workspaceInsertSessionBeforeValueSchema,
+   'workspace.archiveSession': workspaceArchiveSessionValueSchema,
++  'workspace.unarchiveSession': workspaceUnarchiveSessionValueSchema,
+   'skill.list': skillListValueSchema,
+   'agentPreset.list': agentPresetListValueSchema,
+   'agentPreset.select': agentPresetSelectValueSchema,
+@@ -451,6 +454,7 @@ export abstract class AbstractApiClient implements IApiClient {
+     insertBefore: (payload, signal) => this.callUnary('workspace.insertBefore', payload, signal),
+     insertSessionBefore: (payload, signal) => this.callUnary('workspace.insertSessionBefore', payload, signal),
+     archiveSession: (payload, signal) => this.callUnary('workspace.archiveSession', payload, signal),
++    unarchiveSession: (payload, signal) => this.callUnary('workspace.unarchiveSession', payload, signal),
+   }
+ 
+   readonly skills: IApiClient['skills'] = {
+diff --git a/packages/host/apiproxy/src/fetch/handler.ts b/packages/host/apiproxy/src/fetch/handler.ts
+index 697171ec53..ec015560cd 100644
+--- a/packages/host/apiproxy/src/fetch/handler.ts
++++ b/packages/host/apiproxy/src/fetch/handler.ts
+@@ -42,6 +42,7 @@ import {
+   workspaceInsertSessionBeforeRequestSchema,
+   workspaceListRequestSchema,
+   workspaceRenameRequestSchema,
++  workspaceUnarchiveSessionRequestSchema,
+ } from '../api/workspace.schema.ts'
+ import { skillListRequestSchema } from '../api/skills.schema.ts'
+ import {
+@@ -116,6 +117,7 @@ const UNARY_ROUTES: UnaryRoutes = {
+   'workspace.insertBefore': { schema: workspaceInsertBeforeRequestSchema, invoke: (api, r) => api.workspace.insertBefore(r) },
+   'workspace.insertSessionBefore': { schema: workspaceInsertSessionBeforeRequestSchema, invoke: (api, r) => api.workspace.insertSessionBefore(r) },
+   'workspace.archiveSession': { schema: workspaceArchiveSessionRequestSchema, invoke: (api, r) => api.workspace.archiveSession(r) },
++  'workspace.unarchiveSession': { schema: workspaceUnarchiveSessionRequestSchema, invoke: (api, r) => api.workspace.unarchiveSession(r) },
+   'skill.list': { schema: skillListRequestSchema, invoke: (api, r) => api.skills.list(r) },
+   'agentPreset.list': { schema: agentPresetListRequestSchema, invoke: (api, r) => api.agentPresets.list(r) },
+   'agentPreset.select': { schema: agentPresetSelectRequestSchema, invoke: (api, r) => api.agentPresets.select(r) },
+diff --git a/packages/host/apiproxy/tests/api-proxy-workspace.spec.ts b/packages/host/apiproxy/tests/api-proxy-workspace.spec.ts
+index 54bdb015e4..b259c89b71 100644
+--- a/packages/host/apiproxy/tests/api-proxy-workspace.spec.ts
++++ b/packages/host/apiproxy/tests/api-proxy-workspace.spec.ts
+@@ -567,4 +567,41 @@ describe('Host Workspace increments', () => {
+     })
+     abort.abort()
+   })
++
++  it('unarchives a session back into its accounting and streams the changed set', async () => {
++    const { api, root } = await harness()
++    const workspace = expectOk(await api.workspace.create(request({ path: stageDir(root, 'unarchive-home') }))).workspace
++    const sessionId = SessionId('session-to-restore')
++    expectOk(await api.sessions.create(request({ workspaceId: workspace.workspaceId, sessionId })))
++    expectOk(await api.workspace.archiveSession(request({ sessionId })))
++
++    const abort = new AbortController()
++    const stream: AsyncIterator<RpcRequest<HostFrame>> =
++      api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
++    const changed = nextHostFrame(stream)
++    expect(expectOk(await api.workspace.unarchiveSession(request({ sessionId }))).archivedSessionIds)
++      .toEqual([])
++    expect(await changed).toMatchObject({
++      payload: { type: 'host/archived-sessions-changed', archivedSessionIds: [] },
++    })
++
++    // Accounting was never touched, so the session reappears in place; the
++    // idempotent repeat is a no-op success and emits no second frame.
++    const listed = expectOk(await api.workspace.list(request({})))
++    expect(listed.archivedSessionIds).toEqual([])
++    expect(listed.items[0]?.sessionIds).toEqual([sessionId])
++    const after = nextHostFrame(stream)
++    expect(expectOk(await api.workspace.unarchiveSession(request({ sessionId }))).archivedSessionIds)
++      .toEqual([])
++    expectOk(await api.workspace.archiveSession(request({ sessionId })))
++    expect((await after).payload).toMatchObject({
++      type: 'host/archived-sessions-changed',
++      archivedSessionIds: [sessionId],
++    })
++
++    // An id that is not archived is an idempotent success, never an error.
++    const unknown = await api.workspace.unarchiveSession(request({ sessionId: SessionId('session-ghost') }))
++    expect(unknown.result?.ok).toBe(true)
++    abort.abort()
++  })
+ })
+diff --git a/packages/host/apiproxy/tests/client-handler.spec.ts b/packages/host/apiproxy/tests/client-handler.spec.ts
+index 4130d8f210..b76d032f98 100644
+--- a/packages/host/apiproxy/tests/client-handler.spec.ts
++++ b/packages/host/apiproxy/tests/client-handler.spec.ts
+@@ -88,6 +88,7 @@ function scriptedApi(overrides: {
+       insertBefore: r => ok(r, { workspaceIds: [r.payload.workspaceId] }),
+       insertSessionBefore: r => ok(r, { workspace: { workspaceId: 'w1' as never, path: '/t', title: 't', sessionIds: [], createdAt: '0', updatedAt: '0' } }),
+       archiveSession: r => ok(r, { archivedSessionIds: [r.payload.sessionId] }),
++      unarchiveSession: r => ok(r, { archivedSessionIds: [] }),
+     },
+     skills: { list: r => ok(r, { skills: [] }), ...overrides.skills },
+     agentPresets: {
+diff --git a/packages/host/apiproxy/tests/fetch-carrier.spec.ts b/packages/host/apiproxy/tests/fetch-carrier.spec.ts
+index 2000f708ba..2282b90b4e 100644
+--- a/packages/host/apiproxy/tests/fetch-carrier.spec.ts
++++ b/packages/host/apiproxy/tests/fetch-carrier.spec.ts
+@@ -191,6 +191,9 @@ function fakeApi(overrides: Partial<{ muxFrames: MuxFrame[]; hostFrames: HostFra
+       async archiveSession(request) {
+         return { rpcId: request.rpcId, result: { ok: true, value: { archivedSessionIds: [request.payload.sessionId] } } }
+       },
++      async unarchiveSession(request) {
++        return { rpcId: request.rpcId, result: { ok: true, value: { archivedSessionIds: [] } } }
++      },
+     },
+     agentPresets: {
+       list(request: RpcRequest<{}>) {
+diff --git a/packages/test-support/client-runtime/src/workspaces.ts b/packages/test-support/client-runtime/src/workspaces.ts
+index 4f6b2122cb..8cab5928e4 100644
+--- a/packages/test-support/client-runtime/src/workspaces.ts
++++ b/packages/test-support/client-runtime/src/workspaces.ts
+@@ -201,7 +201,7 @@ export class TestWorkspaces implements IWorkspaces {
+    * observable effect: the id joins the list state's archive set.
+    * @param sessionId - session to archive.
+    */
+-  async archiveSession(sessionId: SessionId): Promise<void> {
++   async archiveSession(sessionId: SessionId): Promise<void> {
+     this.calls.push({ method: 'archiveSession', args: [sessionId] })
+     const stub = this.stubs.get('archiveSession')
+     if (stub !== undefined) {
+@@ -212,4 +212,21 @@ export class TestWorkspaces implements IWorkspaces {
+       draft.archivedSessionIds = [...draft.archivedSessionIds, sessionId]
+     })
+   }
++
++  /**
++   * Restore an archived session (recorded). The default mirrors the
++   * production face's observable effect: the id leaves the archive set.
++   * @param sessionId - archived session to restore.
++   */
++  async unarchiveSession(sessionId: SessionId): Promise<void> {
++    this.calls.push({ method: 'unarchiveSession', args: [sessionId] })
++    const stub = this.stubs.get('unarchiveSession')
++    if (stub !== undefined) {
++      await (stub(sessionId) as Promise<void>)
++      return
++    }
++    await this.update((draft) => {
++      draft.archivedSessionIds = draft.archivedSessionIds.filter(id => id !== sessionId)
++    })
++  }
+ }
+diff --git a/packages/workspace/workspace/src/index.ts b/packages/workspace/workspace/src/index.ts
+index 87edb28cad..08306e1c1c 100644
+--- a/packages/workspace/workspace/src/index.ts
++++ b/packages/workspace/workspace/src/index.ts
+@@ -254,6 +254,25 @@ export class WorkspaceRegistry extends Service {
+     })
+   }
+ 
++  /**
++   * Restore one archived session durably. Unarchiving never touches workspace
++   * accounting — the session returns to its existing `sessionIds` slot, which
++   * is exactly why the archive set stays out of the one-owner invariant. An id
++   * not currently archived resolves without writing.
++   * @param sessionId - The archived session to restore.
++   * @returns resolution after durability.
++   */
++  unarchiveSession(sessionId: SessionId): Promise<void> {
++    return this.enqueueOperation(async () => {
++      const state = this.requireState()
++      if (!state.archivedSessionIds.includes(sessionId)) return
++      await this.setState({
++        ...state,
++        archivedSessionIds: state.archivedSessionIds.filter(id => id !== sessionId),
++      })
++    })
++  }
++
+   /**
+    * Whether a session is live, header-indexed, or present in a fresh
+    * persistence listing. Only a definite miss returns false — a failing
+diff --git a/packages/workspace/workspace/tests/workspace.spec.ts b/packages/workspace/workspace/tests/workspace.spec.ts
+index 22900c7649..f060fbcec0 100644
+--- a/packages/workspace/workspace/tests/workspace.spec.ts
++++ b/packages/workspace/workspace/tests/workspace.spec.ts
+@@ -921,6 +921,38 @@ describe('registry-global session archive', () => {
+     expect(storedState(result.pool).archivedSessionIds).toEqual([])
+   })
+ 
++  it('unarchives durably in place, keeps accounting order, and ignores repeats and unknowns', async () => {
++    const dir = await makeDir('unarchive-home')
++    const result = await harness({ sessions: [header('kept', dir, 100), header('gone', dir, 200)] })
++    const workspace = result.registry.list()[0]!
++    await result.registry.archiveSession(SessionId('kept'))
++    await result.registry.archiveSession(SessionId('gone'))
++    expect(result.registry.archivedSessionIds).toEqual(['kept', 'gone'])
++    const accountBefore = workspace.sessionIds.slice()
++
++    await result.registry.unarchiveSession(SessionId('gone'))
++    expect(result.registry.archivedSessionIds).toEqual(['kept'])
++    expect(storedState(result.pool).archivedSessionIds).toEqual(['kept'])
++    // The workspace account slot is untouched: the session returns in place.
++    expect(workspace.sessionIds).toEqual(accountBefore)
++    expect(workspace.sessionIds).toContain('gone')
++    const changesAfterFirst = result.changes.filter(change => change.table === '').length
++
++    // Idempotent: the repeat neither rewrites the medium nor emits a change.
++    await result.registry.unarchiveSession(SessionId('gone'))
++    expect(result.registry.archivedSessionIds).toEqual(['kept'])
++    expect(result.changes.filter(change => change.table === '').length).toBe(changesAfterFirst)
++
++    // An id that is not archived is a silent no-op, never an error.
++    await result.registry.unarchiveSession(SessionId('ghost'))
++    expect(result.registry.archivedSessionIds).toEqual(['kept'])
++
++    // Restoring the remaining id empties the set without touching the table.
++    await result.registry.unarchiveSession(SessionId('kept'))
++    expect(result.registry.archivedSessionIds).toEqual([])
++    expect(storedState(result.pool).archivedSessionIds).toEqual([])
++  })
++
+   it('restores the archive set across restarts and defaults it for pre-field media', async () => {
+     const dir = await makeDir('archive-restart')
+     const pool = new MemoryMediaPool()
+diff --git a/tsconfig.base.json b/tsconfig.base.json
+index 16d69db6db..1bad787ba3 100644
+--- a/tsconfig.base.json
++++ b/tsconfig.base.json
+@@ -212,6 +212,7 @@
+       "@deepseek-ai/dsh-client-ui-plan": ["./packages/client/ui-plan/src"],
+       "@deepseek-ai/dsh-client-ui-user-questions": ["./packages/client/ui-user-questions/src"],
+       "@deepseek-ai/dsh-client-ui-trajectory": ["./packages/client/ui-trajectory/src"],
++      "@deepseek-ai/dsh-client-ui-unarchive": ["./packages/client/ui-unarchive/src"],
+       "@deepseek-ai/dsh-client-ui-workspace": ["./packages/client/ui-workspace/src"],
+       "@deepseek-ai/dsh-client-ui-theme": ["./packages/client/ui-theme/src"],
+       "@deepseek-ai/dsh-client-ui-settings": ["./packages/client/ui-settings/src"],
